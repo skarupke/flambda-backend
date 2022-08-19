@@ -26,6 +26,9 @@
 #include <sys/time.h>
 #ifdef __linux__
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#include <limits.h>
 #endif
 
 typedef int st_retcode;
@@ -109,6 +112,36 @@ Caml_inline void st_thread_set_id(intnat id)
   return;
 }
 
+typedef struct {
+  volatile unsigned counter;
+} custom_condvar;
+
+void custom_condvar_init(custom_condvar * cv)
+{
+  cv->counter = 0;
+}
+
+void custom_condvar_wait(custom_condvar * cv, pthread_mutex_t * mutex)
+{
+  unsigned old_count = cv->counter;
+  pthread_mutex_unlock(mutex);
+  syscall(SYS_futex, &cv->counter, FUTEX_WAIT_PRIVATE, old_count, NULL, NULL, 0);
+  pthread_mutex_lock(mutex);
+}
+
+void custom_condvar_signal(custom_condvar * cv)
+{
+  __sync_add_and_fetch(&cv->counter, 1);
+  syscall(SYS_futex, &cv->counter, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+
+void custom_condvar_broadcast(custom_condvar * cv)
+{
+  __sync_add_and_fetch(&cv->counter, 1);
+  syscall(SYS_futex, &cv->counter, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+
 /* The master lock.  This is a mutex that is held most of the time,
    so we implement it in a slightly convoluted way to avoid
    all risks of busy-waiting.  Also, we count the number of waiting
@@ -118,13 +151,13 @@ typedef struct {
   pthread_mutex_t lock;         /* to protect contents  */
   int busy;                     /* 0 = free, 1 = taken */
   volatile int waiters;         /* number of threads waiting on master lock */
-  pthread_cond_t is_free;       /* signaled when free */
+  custom_condvar is_free;       /* signaled when free */
 } st_masterlock;
 
 static void st_masterlock_init(st_masterlock * m)
 {
   pthread_mutex_init(&m->lock, NULL);
-  pthread_cond_init(&m->is_free, NULL);
+  custom_condvar_init(&m->is_free);
   m->busy = 1;
   m->waiters = 0;
 }
@@ -134,7 +167,7 @@ static void st_masterlock_acquire(st_masterlock * m)
   pthread_mutex_lock(&m->lock);
   while (m->busy) {
     m->waiters ++;
-    pthread_cond_wait(&m->is_free, &m->lock);
+    custom_condvar_wait(&m->is_free, &m->lock);
     m->waiters --;
   }
   m->busy = 1;
@@ -146,7 +179,7 @@ static void st_masterlock_release(st_masterlock * m)
   pthread_mutex_lock(&m->lock);
   m->busy = 0;
   pthread_mutex_unlock(&m->lock);
-  pthread_cond_signal(&m->is_free);
+  custom_condvar_signal(&m->is_free);
 }
 
 CAMLno_tsan  /* This can be called for reading [waiters] without locking. */
@@ -179,14 +212,14 @@ Caml_inline void st_thread_yield(st_masterlock * m)
   }
 
   m->busy = 0;
-  pthread_cond_signal(&m->is_free);
+  custom_condvar_signal(&m->is_free);
   m->waiters++;
   do {
     /* Note: the POSIX spec prevents the above signal from pairing with this
        wait, which is good: we'll reliably continue waiting until the next
        yield() or enter_blocking_section() call (or we see a spurious condvar
        wakeup, which are rare at best.) */
-       pthread_cond_wait(&m->is_free, &m->lock);
+       custom_condvar_wait(&m->is_free, &m->lock);
   } while (m->busy);
   m->busy = 1;
   m->waiters--;
