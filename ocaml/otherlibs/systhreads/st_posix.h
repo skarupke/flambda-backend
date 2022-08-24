@@ -116,29 +116,38 @@ typedef struct {
   volatile unsigned counter;
 } custom_condvar;
 
-void custom_condvar_init(custom_condvar * cv)
+int custom_condvar_init(custom_condvar * cv)
 {
   cv->counter = 0;
+  return 0;
 }
 
-void custom_condvar_wait(custom_condvar * cv, pthread_mutex_t * mutex)
+int custom_condvar_destroy(custom_condvar * cv)
+{
+  return 0;
+}
+
+int custom_condvar_wait(custom_condvar * cv, pthread_mutex_t * mutex)
 {
   unsigned old_count = cv->counter;
   pthread_mutex_unlock(mutex);
   syscall(SYS_futex, &cv->counter, FUTEX_WAIT_PRIVATE, old_count, NULL, NULL, 0);
   pthread_mutex_lock(mutex);
+  return 0;
 }
 
-void custom_condvar_signal(custom_condvar * cv)
+int custom_condvar_signal(custom_condvar * cv)
 {
   __sync_add_and_fetch(&cv->counter, 1);
   syscall(SYS_futex, &cv->counter, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+  return 0;
 }
 
-void custom_condvar_broadcast(custom_condvar * cv)
+int custom_condvar_broadcast(custom_condvar * cv)
 {
   __sync_add_and_fetch(&cv->counter, 1);
   syscall(SYS_futex, &cv->counter, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+  return 0;
 }
 
 
@@ -287,14 +296,14 @@ Caml_inline int st_mutex_unlock(st_mutex m)
 
 /* Condition variables */
 
-typedef pthread_cond_t * st_condvar;
+typedef custom_condvar * st_condvar;
 
 static int st_condvar_create(st_condvar * res)
 {
   int rc;
-  st_condvar c = caml_stat_alloc_noexc(sizeof(pthread_cond_t));
+  st_condvar c = caml_stat_alloc_noexc(sizeof(custom_condvar));
   if (c == NULL) return ENOMEM;
-  rc = pthread_cond_init(c, NULL);
+  rc = custom_condvar_init(c);
   if (rc != 0) { caml_stat_free(c); return rc; }
   *res = c;
   return 0;
@@ -303,24 +312,24 @@ static int st_condvar_create(st_condvar * res)
 static int st_condvar_destroy(st_condvar c)
 {
   int rc;
-  rc = pthread_cond_destroy(c);
+  rc = custom_condvar_destroy(c);
   caml_stat_free(c);
   return rc;
 }
 
 Caml_inline int st_condvar_signal(st_condvar c)
 {
-  return pthread_cond_signal(c);
+  return custom_condvar_signal(c);
 }
 
 Caml_inline int st_condvar_broadcast(st_condvar c)
 {
-  return pthread_cond_broadcast(c);
+  return custom_condvar_broadcast(c);
 }
 
 Caml_inline int st_condvar_wait(st_condvar c, st_mutex m)
 {
-  return pthread_cond_wait(c, m);
+  return custom_condvar_wait(c, m);
 }
 
 /* Triggered events */
@@ -328,7 +337,7 @@ Caml_inline int st_condvar_wait(st_condvar c, st_mutex m)
 typedef struct st_event_struct {
   pthread_mutex_t lock;         /* to protect contents */
   int status;                   /* 0 = not triggered, 1 = triggered */
-  pthread_cond_t triggered;     /* signaled when triggered */
+  custom_condvar triggered;     /* signaled when triggered */
 } * st_event;
 
 static int st_event_create(st_event * res)
@@ -338,7 +347,7 @@ static int st_event_create(st_event * res)
   if (e == NULL) return ENOMEM;
   rc = pthread_mutex_init(&e->lock, NULL);
   if (rc != 0) { caml_stat_free(e); return rc; }
-  rc = pthread_cond_init(&e->triggered, NULL);
+  rc = custom_condvar_init(&e->triggered);
   if (rc != 0)
   { pthread_mutex_destroy(&e->lock); caml_stat_free(e); return rc; }
   e->status = 0;
@@ -350,7 +359,7 @@ static int st_event_destroy(st_event e)
 {
   int rc1, rc2;
   rc1 = pthread_mutex_destroy(&e->lock);
-  rc2 = pthread_cond_destroy(&e->triggered);
+  rc2 = custom_condvar_destroy(&e->triggered);
   caml_stat_free(e);
   return rc1 != 0 ? rc1 : rc2;
 }
@@ -363,7 +372,7 @@ static int st_event_trigger(st_event e)
   e->status = 1;
   rc = pthread_mutex_unlock(&e->lock);
   if (rc != 0) return rc;
-  rc = pthread_cond_broadcast(&e->triggered);
+  rc = custom_condvar_broadcast(&e->triggered);
   return rc;
 }
 
@@ -373,7 +382,7 @@ static int st_event_wait(st_event e)
   rc = pthread_mutex_lock(&e->lock);
   if (rc != 0) return rc;
   while(e->status == 0) {
-    rc = pthread_cond_wait(&e->triggered, &e->lock);
+    rc = custom_condvar_wait(&e->triggered, &e->lock);
     if (rc != 0) return rc;
   }
   rc = pthread_mutex_unlock(&e->lock);
